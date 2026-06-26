@@ -277,6 +277,20 @@ with tab_predict:
         if not home or not away:
             st.write(f"Match {m['slot']+1}: TBD vs TBD (waiting on previous round)")
             continue
+
+        # Lock predictions 1 hour before kick-off (or if result already entered)
+        locked = False
+        if m.get("match_date") and m.get("match_time"):
+            try:
+                kick_off = datetime.strptime(
+                    f"{m['match_date']} {m['match_time']}", "%Y-%m-%d %H:%M"
+                )
+                locked = datetime.utcnow() >= kick_off - timedelta(hours=1)
+            except Exception:
+                pass
+        elif m["actual_home"] is not None:
+            locked = True
+
         cols = st.columns([3, 1, 1])
         cols[0].write(f"**{home}** vs **{away}**")
         date_str = fmt_match_date(m)
@@ -286,10 +300,14 @@ with tab_predict:
         default_h = existing["pred_home"] if existing else 0
         default_a = existing["pred_away"] if existing else 0
         ph = cols[1].number_input("Home", min_value=0, max_value=20, value=default_h,
-                                   key=f"ph_{m['id']}", label_visibility="collapsed")
+                                   key=f"ph_{m['id']}", label_visibility="collapsed",
+                                   disabled=locked)
         pa = cols[2].number_input("Away", min_value=0, max_value=20, value=default_a,
-                                   key=f"pa_{m['id']}", label_visibility="collapsed")
-        if st.button("Save", key=f"save_{m['id']}", use_container_width=True):
+                                   key=f"pa_{m['id']}", label_visibility="collapsed",
+                                   disabled=locked)
+        if locked:
+            st.caption("🔒 Predictions locked — less than 1 hour to kick-off.")
+        elif st.button("Save", key=f"save_{m['id']}", use_container_width=True):
             db.upsert_prediction(m["id"], player["id"], ph, pa)
             st.toast(f"Saved: {home} {ph}-{pa} {away}")
 
@@ -316,8 +334,8 @@ with tab_leaderboard:
                 {
                     "Rank": i + 1,
                     "Player": row["name"],
-                    "Points": row["points"],
-                    "Exact scores": row["exact"],
+                    "Total Points": row["points"],
+                    "Correct Goal Score": row["exact"],
                     "Correct outcomes": row["correct"],
                 }
                 for i, row in enumerate(lb)
