@@ -1,6 +1,6 @@
 # World Cup Predictor
 
-**Live app:** https://snpoudel-worldcup-predictor.streamlit.app
+**Live app:** https://worldcup-goal.streamlit.app/
 
 Predict World Cup 2026 knockout match scores with friends — from Round of 32 all the way to the Final.
 
