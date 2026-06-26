@@ -115,6 +115,18 @@ def create_group(name):
     return code, group_id
 
 
+def delete_group(group_id):
+    """Permanently delete a group and all its matches, players, and predictions."""
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM predictions WHERE match_id IN "
+            "(SELECT id FROM matches WHERE group_id=?)", (group_id,)
+        )
+        conn.execute("DELETE FROM matches WHERE group_id=?", (group_id,))
+        conn.execute("DELETE FROM players WHERE group_id=?", (group_id,))
+        conn.execute("DELETE FROM groups WHERE id=?", (group_id,))
+
+
 def get_all_groups():
     with get_conn() as conn:
         rows = conn.execute(

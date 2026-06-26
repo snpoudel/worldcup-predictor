@@ -124,6 +124,55 @@ if st.session_state.group is None:
                 st.query_params["g"] = g["code"]
                 st.rerun()
 
+    # Admin panel — password-protected, only visible to you
+    st.divider()
+    with st.expander("🔧 Admin"):
+        try:
+            _admin_pwd = st.secrets.get("ADMIN_PASSWORD", "")
+        except Exception:
+            _admin_pwd = ""
+
+        if not _admin_pwd:
+            st.caption("Set `ADMIN_PASSWORD` in Streamlit Cloud → Settings → Secrets to enable.")
+        elif not st.session_state.get("admin_unlocked"):
+            _entered = st.text_input("Admin password", type="password", key="admin_pwd_input")
+            if st.button("Unlock", key="admin_unlock_btn"):
+                if _entered == _admin_pwd:
+                    st.session_state.admin_unlocked = True
+                    st.rerun()
+                else:
+                    st.error("Wrong password.")
+        else:
+            col_hd, col_lock = st.columns([5, 1])
+            col_hd.write("**Delete a group — permanent, cannot be undone.**")
+            if col_lock.button("Lock", key="admin_lock_btn"):
+                st.session_state.admin_unlocked = False
+                st.session_state.pop("delete_confirm_gid", None)
+                st.rerun()
+
+            _confirm_id = st.session_state.get("delete_confirm_gid")
+            for g in db.get_all_groups():
+                c1, c2 = st.columns([5, 1])
+                c1.write(g["name"])
+                if _confirm_id == g["id"]:
+                    st.warning(
+                        f"Delete **{g['name']}** and all its players, predictions, and "
+                        "matches? This cannot be undone."
+                    )
+                    cy, cn = st.columns(2)
+                    if cy.button("Yes, delete", key=f"yes_del_{g['id']}",
+                                 type="primary", use_container_width=True):
+                        db.delete_group(g["id"])
+                        st.session_state.pop("delete_confirm_gid", None)
+                        st.rerun()
+                    if cn.button("Cancel", key=f"no_del_{g['id']}", use_container_width=True):
+                        st.session_state.pop("delete_confirm_gid", None)
+                        st.rerun()
+                else:
+                    if c2.button("🗑️", key=f"del_{g['id']}"):
+                        st.session_state.delete_confirm_gid = g["id"]
+                        st.rerun()
+
     st.stop()
 
 group = st.session_state.group
