@@ -39,12 +39,8 @@ def fetch_feed():
     return resp.json()
 
 
-def extract_knockout_results(feed_json):
-    """Return a list of dicts: {round, slot, team1, team2, home, away}
-    for every knockout match that has a final score in the feed.
-    `slot` is our 0-indexed position within the round.
-    Returns [] if no knockout matches have results yet (e.g. still in groups)."""
-    results = []
+def _iter_knockout_matches(feed_json):
+    """Yield (our_round, slot, raw_match) for every knockout match in the feed."""
     for m in feed_json.get("matches", []):
         our_round = FEED_ROUND_TO_OURS.get(m.get("round"))
         if not our_round:
@@ -55,10 +51,31 @@ def extract_knockout_results(feed_json):
         lo, hi = NUM_RANGES[our_round]
         if not (lo <= num <= hi):
             continue
+        yield our_round, num - lo, m
+
+
+def extract_all_knockout_info(feed_json):
+    """Return team names + schedule dates for ALL knockout matches (played or not)."""
+    info = []
+    for our_round, slot, m in _iter_knockout_matches(feed_json):
+        info.append({
+            "round": our_round,
+            "slot": slot,
+            "team1": m.get("team1"),
+            "team2": m.get("team2"),
+            "date": m.get("date"),
+            "time": m.get("time"),
+        })
+    return info
+
+
+def extract_knockout_results(feed_json):
+    """Return played knockout matches with final scores."""
+    results = []
+    for our_round, slot, m in _iter_knockout_matches(feed_json):
         score = m.get("score", {}).get("ft")
         if not score:
-            continue  # not played yet
-        slot = num - lo
+            continue
         results.append({
             "round": our_round,
             "slot": slot,
@@ -71,53 +88,52 @@ def extract_knockout_results(feed_json):
 
 
 def sync_results(group_id, db_module):
-    """Pull live results and apply them to our bracket for the given group.
+    """Pull live feed and apply to our bracket for the given group.
     Returns (num_updated, num_skipped_draws, error_message_or_None).
 
-    - Updates team names from the feed (since our local R16+ start as TBD
-      until earlier rounds resolve -- feed already knows real team names
-      once their group stage / previous knockout round is final).
-    - Applies scores via db.set_result(), which also auto-advances winners.
-    - Draws are skipped automatically (flagged for manual penalty-winner
-      entry in the Admin tab), since the feed doesn't reliably carry
-      penalty-shootout outcomes.
+    First syncs team names + match dates for every knockout match (even
+    unplayed ones — the schedule is known in advance). Then applies scores
+    for played matches via db.set_result(), which auto-advances winners.
+    Draws need a manual penalty-winner pick in the Admin tab.
     """
     try:
         feed = fetch_feed()
     except Exception as e:
         return 0, 0, f"Could not fetch live scores: {e}"
 
-    knockout_results = extract_knockout_results(feed)
-    if not knockout_results:
-        return 0, 0, "No knockout results available yet in the feed."
-
     existing = {(m["round"], m["slot"]): m for m in db_module.get_matches(group_id)}
+
+    # Sync team names + dates for all knockout matches (played or not)
+    all_info = extract_all_knockout_info(feed)
+    if not all_info:
+        return 0, 0, "No knockout data available in the feed yet."
+
+    for info in all_info:
+        local = existing.get((info["round"], info["slot"]))
+        if not local:
+            continue
+        if info["team1"] and info["team2"]:
+            db_module.update_team_names(
+                local["id"], info["team1"], info["team2"],
+                info.get("date"), info.get("time"),
+            )
+        elif info.get("date") or info.get("time"):
+            db_module.update_match_date(local["id"], info.get("date"), info.get("time"))
+
+    # Sync scores for played matches
     updated = 0
     skipped_draws = 0
-
-    for r in knockout_results:
-        key = (r["round"], r["slot"])
-        local_match = existing.get(key)
+    for r in extract_knockout_results(feed):
+        local_match = existing.get((r["round"], r["slot"]))
         if not local_match:
             continue
-        # Already has this exact result recorded -- skip re-applying.
         if (local_match["actual_home"] == r["home"]
                 and local_match["actual_away"] == r["away"]):
             continue
-
-        # Sync team names if the feed has real names and ours are still TBD
-        # or placeholders.
-        if r["team1"] and r["team2"]:
-            db_module.update_team_names(local_match["id"], r["team1"], r["team2"])
-
+        db_module.set_result(local_match["id"], r["home"], r["away"])
         if r["home"] == r["away"]:
-            # Draw decided on penalties -- feed's ft score alone can't tell us
-            # who advances. Record the scoreline for prediction-scoring
-            # purposes, but don't auto-advance; flag for manual handling.
-            db_module.set_result(local_match["id"], r["home"], r["away"])
             skipped_draws += 1
         else:
-            db_module.set_result(local_match["id"], r["home"], r["away"])
             updated += 1
 
     return updated, skipped_draws, None

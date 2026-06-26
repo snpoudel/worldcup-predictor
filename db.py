@@ -56,6 +56,8 @@ def init_db():
             team_away TEXT,
             actual_home INTEGER,             -- NULL until result entered
             actual_away INTEGER,
+            match_date TEXT,
+            match_time TEXT,
             UNIQUE(group_id, round, slot)
         );
 
@@ -68,6 +70,13 @@ def init_db():
             UNIQUE(match_id, player_id)
         );
         """)
+    # Migration: add columns to existing databases that predate this schema
+    with get_conn() as conn:
+        for col in ["match_date TEXT", "match_time TEXT"]:
+            try:
+                conn.execute(f"ALTER TABLE matches ADD COLUMN {col}")
+            except Exception:
+                pass  # column already exists
 
 
 def gen_group_code(length=6):
@@ -133,11 +142,20 @@ def get_matches(group_id, round_=None):
         return [dict(r) for r in rows]
 
 
-def update_team_names(match_id, team_home, team_away):
+def update_team_names(match_id, team_home, team_away, match_date=None, match_time=None):
     with get_conn() as conn:
         conn.execute(
-            "UPDATE matches SET team_home = ?, team_away = ? WHERE id = ?",
-            (team_home, team_away, match_id),
+            "UPDATE matches SET team_home=?, team_away=?, "
+            "match_date=COALESCE(?,match_date), match_time=COALESCE(?,match_time) WHERE id=?",
+            (team_home, team_away, match_date, match_time, match_id),
+        )
+
+
+def update_match_date(match_id, match_date, match_time):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE matches SET match_date=COALESCE(?,match_date), match_time=COALESCE(?,match_time) WHERE id=?",
+            (match_date, match_time, match_id),
         )
 
 

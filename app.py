@@ -23,6 +23,22 @@ def result_str(m):
     return f"({m['actual_home']}-{m['actual_away']})"
 
 
+def fmt_match_date(m):
+    date = m.get("match_date")
+    if not date:
+        return ""
+    try:
+        from datetime import datetime
+        d = datetime.strptime(date, "%Y-%m-%d")
+        s = d.strftime("%b %d, %Y")
+    except Exception:
+        s = date
+    t = m.get("match_time")
+    if t:
+        s += f"  ·  {t}"
+    return s
+
+
 # ---------- session state ----------
 if "group" not in st.session_state:
     st.session_state.group = None
@@ -117,6 +133,8 @@ with tab_predict:
         round_choice = st.selectbox(
             "Round", db.ROUNDS, format_func=lambda r: db.ROUND_LABELS[r]
         )
+        st.markdown(f"### {db.ROUND_LABELS[round_choice]}")
+        st.divider()
         matches = db.get_matches(gid, round_choice)
         st.caption("Enter your predicted score for each match. Save updates anytime "
                     "before the actual match kicks off.")
@@ -127,6 +145,9 @@ with tab_predict:
                 continue
             cols = st.columns([3, 1, 1, 1])
             cols[0].write(f"**{home}** vs **{away}**")
+            date_str = fmt_match_date(m)
+            if date_str:
+                cols[0].caption(f"📅 {date_str}")
             existing = db.get_prediction(m["id"], player["id"])
             default_h = existing["pred_home"] if existing else 0
             default_a = existing["pred_away"] if existing else 0
