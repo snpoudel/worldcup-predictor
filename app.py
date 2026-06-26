@@ -115,10 +115,19 @@ if st.session_state.player is None:
     st.title(f"🏆 {group['name']}")
     st.write("Enter your name to start predicting:")
     pname = st.text_input("Your name", placeholder="e.g. Sandeep")
+    ppwd = st.text_input(
+        "Password (optional)",
+        type="password",
+        placeholder="Set one to protect your account",
+    )
     if st.button("Let's go →", type="primary", use_container_width=True):
         if pname.strip():
-            st.session_state.player = db.get_or_create_player(gid, pname)
-            st.rerun()
+            player, err = db.get_or_create_player(gid, pname, ppwd or None)
+            if err:
+                st.error(err)
+            else:
+                st.session_state.player = player
+                st.rerun()
         else:
             st.error("Enter your name.")
     st.stop()
@@ -136,6 +145,32 @@ if _needs_sync:
     with st.spinner("Syncing live scores…"):
         live_scores.sync_results(gid, db)
         db.set_last_synced(gid)
+
+# Status bar — visible on mobile without opening the sidebar
+if "confirm_exit" not in st.session_state:
+    st.session_state.confirm_exit = False
+
+_col_who, _col_exit = st.columns([5, 1])
+_col_who.caption(f"👤 **{st.session_state.player['name']}**  ·  {group['name']}")
+if _col_exit.button("Exit"):
+    st.session_state.confirm_exit = True
+
+if st.session_state.confirm_exit:
+    st.warning(
+        "This will remove you from the group and **delete all your predictions**. "
+        "Are you sure?"
+    )
+    _cy, _cn = st.columns(2)
+    if _cy.button("Yes, exit", type="primary", use_container_width=True):
+        db.remove_player(st.session_state.player["id"])
+        st.session_state.group = None
+        st.session_state.player = None
+        st.session_state.confirm_exit = False
+        st.query_params.clear()
+        st.rerun()
+    if _cn.button("No, stay", use_container_width=True):
+        st.session_state.confirm_exit = False
+        st.rerun()
 
 tab_predict, tab_bracket, tab_leaderboard, tab_all_preds, tab_admin = st.tabs(
     ["📝 Predict", "🏆 Bracket", "📊 Leaderboard", "👀 Predictions", "⚙️ Admin (results)"]

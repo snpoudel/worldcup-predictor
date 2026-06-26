@@ -45,6 +45,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             group_id INTEGER NOT NULL REFERENCES groups(id),
             name TEXT NOT NULL,
+            password_hash TEXT,
             UNIQUE(group_id, name)
         );
 
@@ -77,6 +78,7 @@ def init_db():
             ("matches", "match_date TEXT"),
             ("matches", "match_time TEXT"),
             ("groups",  "last_synced_at TEXT"),
+            ("players", "password_hash TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE {tbl_col[0]} ADD COLUMN {tbl_col[1]}")
@@ -118,18 +120,30 @@ def get_group_by_code(code):
         return dict(row) if row else None
 
 
-def get_or_create_player(group_id, name):
+def get_or_create_player(group_id, name, password=None):
+    """Returns (player_dict, error_str). error_str is None on success."""
+    import hashlib
     name = name.strip()
+    pw_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
+
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM players WHERE group_id = ? AND name = ?", (group_id, name)
         ).fetchone()
         if row:
-            return dict(row)
+            player = dict(row)
+            if player.get("password_hash"):
+                if not password:
+                    return None, "This name is password-protected — enter the password."
+                if pw_hash != player["password_hash"]:
+                    return None, "Wrong password."
+            return player, None
+        # New player — save password hash if provided
         cur = conn.execute(
-            "INSERT INTO players (group_id, name) VALUES (?, ?)", (group_id, name)
+            "INSERT INTO players (group_id, name, password_hash) VALUES (?, ?, ?)",
+            (group_id, name, pw_hash),
         )
-        return {"id": cur.lastrowid, "group_id": group_id, "name": name}
+        return {"id": cur.lastrowid, "group_id": group_id, "name": name, "password_hash": pw_hash}, None
 
 
 def get_matches(group_id, round_=None):
@@ -221,6 +235,13 @@ def _propagate_winner(match, forced_winner=None):
             f"UPDATE matches SET {col} = ? WHERE id = ?",
             (winner, next_match["id"]),
         )
+
+
+def remove_player(player_id):
+    """Delete a player and all their predictions from the group."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM predictions WHERE player_id=?", (player_id,))
+        conn.execute("DELETE FROM players WHERE id=?", (player_id,))
 
 
 def get_match_predictions(match_id):
