@@ -65,7 +65,7 @@ with st.sidebar:
                 st.session_state.player = None
                 st.rerun()
         st.divider()
-        if st.button("Leave group"):
+        if st.button("← Back to home"):
             st.session_state.group = None
             st.session_state.player = None
             st.query_params.clear()
