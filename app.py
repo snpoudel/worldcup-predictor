@@ -2,7 +2,18 @@
 
 Run with: streamlit run app.py
 """
+import os
 import streamlit as st
+
+# Expose Turso credentials from Streamlit secrets as env vars so db.py can read them.
+# Must happen before importing db.
+try:
+    for _k in ("TURSO_URL", "TURSO_TOKEN"):
+        if _k in st.secrets and not os.environ.get(_k):
+            os.environ[_k] = st.secrets[_k]
+except Exception:
+    pass
+
 from datetime import datetime, timedelta
 import db
 import live_scores
