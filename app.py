@@ -19,7 +19,35 @@ import db
 import live_scores
 
 st.set_page_config(page_title="World Cup Predictor", page_icon="🏆", layout="wide")
-db.init_db()
+
+# init_db runs 9 HTTP requests to Turso to check/migrate schema — run once per
+# server process, not on every Streamlit rerender.
+@st.cache_resource
+def _init_db_once():
+    db.init_db()
+
+_init_db_once()
+
+# ---------------------------------------------------------------------------
+# Cached DB reads — shared across all rerenders and all users.
+# Clear explicitly after any write that changes the data.
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=60)
+def _get_matches(gid, rnd=None):
+    return db.get_matches(gid, rnd)
+
+@st.cache_data(ttl=60)
+def _get_player_preds(player_id):
+    return db.get_player_predictions(player_id)
+
+@st.cache_data(ttl=60)
+def _compute_leaderboard(gid):
+    return db.compute_leaderboard(gid)
+
+@st.cache_data(ttl=60)
+def _get_all_match_preds(gid, rnd):
+    return db.get_all_match_predictions(gid, rnd)
 
 # ---------- helpers ----------
 
@@ -257,6 +285,9 @@ if st.session_state.confirm_exit:
     _cy, _cn = st.columns(2)
     if _cy.button("Yes, exit", type="primary", use_container_width=True):
         db.remove_player(st.session_state.player["id"])
+        _get_player_preds.clear()
+        _compute_leaderboard.clear()
+        _get_all_match_preds.clear()
         st.session_state.group = None
         st.session_state.player = None
         st.session_state.confirm_exit = False
@@ -278,7 +309,8 @@ with tab_predict:
     )
     st.markdown(f"### {db.ROUND_LABELS[round_choice]}")
     st.divider()
-    matches = db.get_matches(gid, round_choice)
+    matches = _get_matches(gid, round_choice)
+    _player_preds = _get_player_preds(player["id"])
     st.caption("Enter your predicted score for each match. Save updates anytime before kick-off.")
     for m in matches:
         home, away = m["team_home"], m["team_away"]
@@ -304,7 +336,7 @@ with tab_predict:
         date_str = fmt_match_date(m)
         if date_str:
             cols[0].caption(f"📅 {date_str}")
-        existing = db.get_prediction(m["id"], player["id"])
+        existing = _player_preds.get(m["id"])
         default_h = existing["pred_home"] if existing else 0
         default_a = existing["pred_away"] if existing else 0
         ph = cols[1].number_input("Home", min_value=0, max_value=20, value=default_h,
@@ -317,6 +349,8 @@ with tab_predict:
             st.caption("🔒 Predictions locked — less than 1 minute to kick-off.")
         elif st.button("Save", key=f"save_{m['id']}", use_container_width=True):
             db.upsert_prediction(m["id"], player["id"], ph, pa)
+            _get_player_preds.clear()
+            _compute_leaderboard.clear()
             st.toast(f"Saved: {home} {ph}-{pa} {away}")
 
 # ---------- Bracket tab — tabs per round (mobile-friendly) ----------
@@ -324,7 +358,7 @@ with tab_bracket:
     round_tabs = st.tabs([db.ROUND_LABELS[r] for r in db.ROUNDS])
     for i, rnd in enumerate(db.ROUNDS):
         with round_tabs[i]:
-            for m in db.get_matches(gid, rnd):
+            for m in _get_matches(gid, rnd):
                 home = m["team_home"] or "TBD"
                 away = m["team_away"] or "TBD"
                 res = result_str(m)
@@ -333,7 +367,7 @@ with tab_bracket:
 
 # ---------- Leaderboard tab ----------
 with tab_leaderboard:
-    lb = db.compute_leaderboard(gid)
+    lb = _compute_leaderboard(gid)
     if not lb:
         st.write("No results entered yet — leaderboard will populate as matches are scored.")
     else:
@@ -357,7 +391,8 @@ with tab_all_preds:
     )
     st.markdown(f"### {db.ROUND_LABELS[round_choice3]}")
     st.divider()
-    for m in db.get_matches(gid, round_choice3):
+    _all_preds_by_match = _get_all_match_preds(gid, round_choice3)
+    for m in _get_matches(gid, round_choice3):
         home = m["team_home"] or "TBD"
         away = m["team_away"] or "TBD"
         header = f"**{home} vs {away}**"
@@ -368,7 +403,7 @@ with tab_all_preds:
         if date_str:
             st.caption(f"📅 {date_str}")
 
-        preds = db.get_match_predictions(m["id"])
+        preds = _all_preds_by_match.get(m["id"], [])
         if not preds:
             st.caption("No predictions yet.")
         else:
@@ -406,6 +441,10 @@ with tab_admin:
         with st.spinner("Fetching live scores..."):
             updated, draws, err = live_scores.sync_results(gid, db)
             db.set_last_synced(gid)
+            st.session_state.last_synced_checked = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            _get_matches.clear()
+            _compute_leaderboard.clear()
+            _get_all_match_preds.clear()
         if err:
             st.error(err)
         else:
@@ -413,7 +452,7 @@ with tab_admin:
             if draws:
                 msg += f" {draws} draw(s) found — set the penalty winner below."
             st.success(msg)
-    _ls = db.get_last_synced(gid)
+    _ls = st.session_state.last_synced_checked
     if _ls:
         st.caption(f"Last synced: {_ls} UTC  ·  Auto-syncs every hour")
 
@@ -421,7 +460,7 @@ with tab_admin:
     round_choice2 = st.selectbox(
         "Round to edit", db.ROUNDS, format_func=lambda r: db.ROUND_LABELS[r], key="admin_round"
     )
-    matches2 = db.get_matches(gid, round_choice2)
+    matches2 = _get_matches(gid, round_choice2)
     for m in matches2:
         with st.expander(f"Match {m['slot']+1}: {match_label(m)} {result_str(m)}"):
             c1, c2 = st.columns(2)
@@ -429,6 +468,7 @@ with tab_admin:
             new_away = c2.text_input("Away team", value=m["team_away"] or "", key=f"ta_{m['id']}")
             if st.button("Update team names", key=f"upd_{m['id']}"):
                 db.update_team_names(m["id"], new_home, new_away)
+                _get_matches.clear()
                 st.rerun()
 
             st.write("Enter result:")
@@ -441,6 +481,9 @@ with tab_admin:
                                   key=f"ra_{m['id']}")
             if c5.button("Save result", key=f"saveres_{m['id']}"):
                 db.set_result(m["id"], rh, ra)
+                _get_matches.clear()
+                _compute_leaderboard.clear()
+                _get_all_match_preds.clear()
                 st.rerun()
 
             is_saved_draw = (
@@ -458,4 +501,5 @@ with tab_admin:
                 )
                 if st.button("Confirm penalty winner", key=f"penbtn_{m['id']}"):
                     db.set_draw_winner(m["id"], winner)
+                    _get_matches.clear()
                     st.rerun()
