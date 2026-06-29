@@ -33,7 +33,7 @@ _init_db_once()
 # Clear explicitly after any write that changes the data.
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=30)
 def _get_matches(gid):
     """Fetch ALL rounds at once — callers partition by round in Python."""
     return db.get_matches(gid)
@@ -58,6 +58,27 @@ def _get_players_with_passwords(gid):
 
 def _matches_for_round(gid, rnd):
     return [m for m in _get_matches(gid) if m["round"] == rnd]
+
+
+def _is_locked(m):
+    """Return True if predictions should be blocked for this match."""
+    if m["actual_home"] is not None:
+        return True
+    if not m.get("match_date"):
+        return False
+    try:
+        time_raw = (m.get("match_time") or "").replace(" UTC", "").strip()
+        # Normalise HH:MM:SS → HH:MM in case feed includes seconds
+        if time_raw:
+            time_raw = ":".join(time_raw.split(":")[:2])
+        if time_raw:
+            kick_off = datetime.strptime(f"{m['match_date']} {time_raw}", "%Y-%m-%d %H:%M")
+        else:
+            kick_off = datetime.strptime(m["match_date"], "%Y-%m-%d")
+        return datetime.utcnow() >= kick_off - timedelta(minutes=1)
+    except Exception:
+        return False
+
 
 # ---------- helpers ----------
 
@@ -334,17 +355,7 @@ def _predict_tab(gid, player_id):
             st.write(f"Match {m['slot']+1}: TBD vs TBD (waiting on previous round)")
             continue
 
-        locked = m["actual_home"] is not None
-        if not locked and m.get("match_date"):
-            try:
-                time_raw = (m.get("match_time") or "").replace(" UTC", "").strip()
-                if time_raw:
-                    kick_off = datetime.strptime(f"{m['match_date']} {time_raw}", "%Y-%m-%d %H:%M")
-                else:
-                    kick_off = datetime.strptime(m["match_date"], "%Y-%m-%d")
-                locked = datetime.utcnow() >= kick_off - timedelta(minutes=1)
-            except Exception:
-                pass
+        locked = _is_locked(m)
 
         cols = st.columns([3, 1, 1])
         cols[0].write(f"**{home}** vs **{away}**")
@@ -363,10 +374,17 @@ def _predict_tab(gid, player_id):
         if locked:
             st.caption("🔒 Predictions locked.")
         elif st.button("Save", key=f"save_{m['id']}", use_container_width=True):
-            db.upsert_prediction(m["id"], player["id"], ph, pa)
-            _get_player_preds.clear()
-            _compute_leaderboard.clear()
-            st.toast(f"Saved: {home} {ph}-{pa} {away}")
+            # Re-verify with a fresh DB read — bypasses cache so stale UI
+            # state can never sneak a prediction through for a locked game.
+            fresh = db.get_match_by_id(m["id"])
+            if fresh and _is_locked(fresh):
+                _get_matches.clear()
+                st.warning("🔒 This match just locked. Refresh to see the updated state.")
+            else:
+                db.upsert_prediction(m["id"], player["id"], ph, pa)
+                _get_player_preds.clear()
+                _compute_leaderboard.clear()
+                st.toast(f"Saved: {home} {ph}-{pa} {away}")
 
 
 @st.fragment

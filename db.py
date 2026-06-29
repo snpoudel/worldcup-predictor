@@ -316,6 +316,12 @@ def remove_player(player_id):
 # Match helpers
 # ---------------------------------------------------------------------------
 
+def get_match_by_id(match_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM matches WHERE id = ?", (match_id,)).fetchone()
+        return dict(row) if row else None
+
+
 def get_matches(group_id, round_=None):
     with get_conn() as conn:
         if round_:

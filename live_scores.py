@@ -54,6 +54,13 @@ def _iter_knockout_matches(feed_json):
         yield our_round, num - lo, m
 
 
+def _team_name(team):
+    """Extract team name from either a plain string or a {name, code} dict."""
+    if isinstance(team, dict):
+        return team.get("name") or team.get("code") or ""
+    return team or ""
+
+
 def extract_all_knockout_info(feed_json):
     """Return team names + schedule dates for ALL knockout matches (played or not)."""
     info = []
@@ -61,8 +68,8 @@ def extract_all_knockout_info(feed_json):
         info.append({
             "round": our_round,
             "slot": slot,
-            "team1": m.get("team1"),
-            "team2": m.get("team2"),
+            "team1": _team_name(m.get("team1")),
+            "team2": _team_name(m.get("team2")),
             "date": m.get("date"),
             "time": m.get("time"),
         })
@@ -79,8 +86,8 @@ def extract_knockout_results(feed_json):
         results.append({
             "round": our_round,
             "slot": slot,
-            "team1": m.get("team1"),
-            "team2": m.get("team2"),
+            "team1": _team_name(m.get("team1")),
+            "team2": _team_name(m.get("team2")),
             "home": score[0],
             "away": score[1],
         })
