@@ -460,6 +460,28 @@ def get_all_match_predictions(group_id, round_):
     return result
 
 
+def get_all_match_predictions_all_rounds(group_id):
+    """Returns {match_id: [pred_dicts]} for ALL rounds in the group (one query)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT pr.match_id, p.name, pr.pred_home, pr.pred_away
+               FROM predictions pr
+               JOIN players p ON p.id = pr.player_id
+               JOIN matches m ON m.id = pr.match_id
+               WHERE m.group_id = ?
+               ORDER BY pr.match_id, p.name""",
+            (group_id,),
+        ).fetchall()
+    result = {}
+    for r in rows:
+        r = dict(r)
+        mid = r["match_id"]
+        if mid not in result:
+            result[mid] = []
+        result[mid].append(r)
+    return result
+
+
 def upsert_prediction(match_id, player_id, pred_home, pred_away):
     with get_conn() as conn:
         conn.execute(

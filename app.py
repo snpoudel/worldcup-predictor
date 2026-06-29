@@ -34,8 +34,9 @@ _init_db_once()
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=60)
-def _get_matches(gid, rnd=None):
-    return db.get_matches(gid, rnd)
+def _get_matches(gid):
+    """Fetch ALL rounds at once — callers partition by round in Python."""
+    return db.get_matches(gid)
 
 @st.cache_data(ttl=60)
 def _get_player_preds(player_id):
@@ -46,12 +47,17 @@ def _compute_leaderboard(gid):
     return db.compute_leaderboard(gid)
 
 @st.cache_data(ttl=60)
-def _get_all_match_preds(gid, rnd):
-    return db.get_all_match_predictions(gid, rnd)
+def _get_all_match_preds(gid):
+    """Fetch predictions for ALL rounds at once — no re-query when round selectbox changes."""
+    return db.get_all_match_predictions_all_rounds(gid)
 
 @st.cache_data(ttl=60)
 def _get_players_with_passwords(gid):
     return db.get_players_with_passwords(gid)
+
+
+def _matches_for_round(gid, rnd):
+    return [m for m in _get_matches(gid) if m["round"] == rnd]
 
 # ---------- helpers ----------
 
@@ -255,7 +261,7 @@ if _needs_sync:
         st.session_state.last_synced_checked = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         _get_matches.clear()
         _compute_leaderboard.clear()
-        _get_all_match_preds.clear()
+        _get_all_match_preds.clear()  # same function, new signature (gid only)
 
 # Status bar — visible on mobile without opening the sidebar
 if "confirm_exit" not in st.session_state:
@@ -296,6 +302,7 @@ if st.session_state.confirm_exit:
         _compute_leaderboard.clear()
         _get_all_match_preds.clear()
         _get_players_with_passwords.clear()
+        _get_matches.clear()
         st.session_state.group = None
         st.session_state.player = None
         st.session_state.confirm_exit = False
@@ -305,20 +312,21 @@ if st.session_state.confirm_exit:
         st.session_state.confirm_exit = False
         st.rerun()
 
-tab_predict, tab_bracket, tab_leaderboard, tab_all_preds, tab_admin = st.tabs(
-    ["📝 Predict", "🏆 Bracket", "📊 Leaderboard", "👀 Predictions", "⚙️ Admin (results)"]
-)
+# ---------------------------------------------------------------------------
+# Tab fragments — each tab is an independent fragment so a button click in one
+# tab only rerenders that tab's ~80 widgets, not all 400+ across the whole app.
+# ---------------------------------------------------------------------------
 
-# ---------- Predict tab ----------
-with tab_predict:
+@st.fragment
+def _predict_tab(gid, player_id):
     player = st.session_state.player
     round_choice = st.selectbox(
         "Round", db.ROUNDS, format_func=lambda r: db.ROUND_LABELS[r]
     )
     st.markdown(f"### {db.ROUND_LABELS[round_choice]}")
     st.divider()
-    matches = _get_matches(gid, round_choice)
-    _player_preds = _get_player_preds(player["id"])
+    matches = _matches_for_round(gid, round_choice)
+    player_preds = _get_player_preds(player_id)
     st.caption("Enter your predicted score for each match. Save updates anytime before kick-off.")
     for m in matches:
         home, away = m["team_home"], m["team_away"]
@@ -326,12 +334,9 @@ with tab_predict:
             st.write(f"Match {m['slot']+1}: TBD vs TBD (waiting on previous round)")
             continue
 
-        # Lock if result is already entered, or within 1 minute of kick-off.
-        # Check actual_home first and independently — don't rely on date/time being set.
         locked = m["actual_home"] is not None
         if not locked and m.get("match_date"):
             try:
-                # Feed stores times as "HH:MM UTC" — strip the suffix before parsing.
                 time_raw = (m.get("match_time") or "").replace(" UTC", "").strip()
                 if time_raw:
                     kick_off = datetime.strptime(f"{m['match_date']} {time_raw}", "%Y-%m-%d %H:%M")
@@ -346,7 +351,7 @@ with tab_predict:
         date_str = fmt_match_date(m)
         if date_str:
             cols[0].caption(f"📅 {date_str}")
-        existing = _player_preds.get(m["id"])
+        existing = player_preds.get(m["id"])
         default_h = existing["pred_home"] if existing else 0
         default_a = existing["pred_away"] if existing else 0
         ph = cols[1].number_input("Home", min_value=0, max_value=20, value=default_h,
@@ -356,27 +361,33 @@ with tab_predict:
                                    key=f"pa_{m['id']}", label_visibility="collapsed",
                                    disabled=locked)
         if locked:
-            st.caption("🔒 Predictions locked — less than 1 minute to kick-off.")
+            st.caption("🔒 Predictions locked.")
         elif st.button("Save", key=f"save_{m['id']}", use_container_width=True):
             db.upsert_prediction(m["id"], player["id"], ph, pa)
             _get_player_preds.clear()
             _compute_leaderboard.clear()
             st.toast(f"Saved: {home} {ph}-{pa} {away}")
 
-# ---------- Bracket tab — tabs per round (mobile-friendly) ----------
-with tab_bracket:
+
+@st.fragment
+def _bracket_tab(gid):
+    all_matches = _get_matches(gid)
+    matches_by_round = {}
+    for m in all_matches:
+        matches_by_round.setdefault(m["round"], []).append(m)
     round_tabs = st.tabs([db.ROUND_LABELS[r] for r in db.ROUNDS])
     for i, rnd in enumerate(db.ROUNDS):
         with round_tabs[i]:
-            for m in _get_matches(gid, rnd):
+            for m in matches_by_round.get(rnd, []):
                 home = m["team_home"] or "TBD"
                 away = m["team_away"] or "TBD"
                 res = result_str(m)
                 st.markdown(f"**{home}** vs **{away}** {res}")
                 st.divider()
 
-# ---------- Leaderboard tab ----------
-with tab_leaderboard:
+
+@st.fragment
+def _leaderboard_tab(gid):
     lb = _compute_leaderboard(gid)
     if not lb:
         st.write("No results entered yet — leaderboard will populate as matches are scored.")
@@ -394,15 +405,16 @@ with tab_leaderboard:
             ]
         )
 
-# ---------- Predictions tab ----------
-with tab_all_preds:
-    round_choice3 = st.selectbox(
+
+@st.fragment
+def _predictions_tab(gid):
+    round_choice = st.selectbox(
         "Round", db.ROUNDS, format_func=lambda r: db.ROUND_LABELS[r], key="preds_round"
     )
-    st.markdown(f"### {db.ROUND_LABELS[round_choice3]}")
+    st.markdown(f"### {db.ROUND_LABELS[round_choice]}")
     st.divider()
-    _all_preds_by_match = _get_all_match_preds(gid, round_choice3)
-    for m in _get_matches(gid, round_choice3):
+    all_preds = _get_all_match_preds(gid)
+    for m in _matches_for_round(gid, round_choice):
         home = m["team_home"] or "TBD"
         away = m["team_away"] or "TBD"
         header = f"**{home} vs {away}**"
@@ -412,8 +424,7 @@ with tab_all_preds:
         date_str = fmt_match_date(m)
         if date_str:
             st.caption(f"📅 {date_str}")
-
-        preds = _all_preds_by_match.get(m["id"], [])
+        preds = all_preds.get(m["id"], [])
         if not preds:
             st.caption("No predictions yet.")
         else:
@@ -431,17 +442,18 @@ with tab_all_preds:
                 st.write(f"- {p['name']}: **{score}**{icon}")
         st.divider()
 
-# ---------- Admin tab ----------
-with tab_admin:
+
+@st.fragment
+def _admin_tab(gid):
     st.caption(
         "Anyone can access this tab — there's no separate admin login. "
         "Use it to enter real match results as they happen; later rounds auto-fill with winners."
     )
 
     with st.expander("👥 Players & passwords"):
-        _all_players = _get_players_with_passwords(gid)
-        if _all_players:
-            st.table([{"Name": p["name"], "Password": p["password"] or "(none)"} for p in _all_players])
+        all_players = _get_players_with_passwords(gid)
+        if all_players:
+            st.table([{"Name": p["name"], "Password": p["password"] or "(none)"} for p in all_players])
         else:
             st.caption("No players yet.")
 
@@ -462,6 +474,7 @@ with tab_admin:
             if draws:
                 msg += f" {draws} draw(s) found — set the penalty winner below."
             st.success(msg)
+        st.rerun(scope="app")
     _ls = st.session_state.last_synced_checked
     if _ls:
         st.caption(f"Last synced: {_ls} UTC  ·  Auto-syncs every hour")
@@ -470,7 +483,7 @@ with tab_admin:
     round_choice2 = st.selectbox(
         "Round to edit", db.ROUNDS, format_func=lambda r: db.ROUND_LABELS[r], key="admin_round"
     )
-    matches2 = _get_matches(gid, round_choice2)
+    matches2 = _matches_for_round(gid, round_choice2)
     for m in matches2:
         with st.expander(f"Match {m['slot']+1}: {match_label(m)} {result_str(m)}"):
             c1, c2 = st.columns(2)
@@ -479,7 +492,7 @@ with tab_admin:
             if st.button("Update team names", key=f"upd_{m['id']}"):
                 db.update_team_names(m["id"], new_home, new_away)
                 _get_matches.clear()
-                st.rerun()
+                st.rerun(scope="app")
 
             st.write("Enter result:")
             c3, c4, c5 = st.columns(3)
@@ -494,7 +507,7 @@ with tab_admin:
                 _get_matches.clear()
                 _compute_leaderboard.clear()
                 _get_all_match_preds.clear()
-                st.rerun()
+                st.rerun(scope="app")
 
             is_saved_draw = (
                 m["actual_home"] is not None
@@ -512,4 +525,24 @@ with tab_admin:
                 if st.button("Confirm penalty winner", key=f"penbtn_{m['id']}"):
                     db.set_draw_winner(m["id"], winner)
                     _get_matches.clear()
-                    st.rerun()
+                    st.rerun(scope="app")
+
+
+# ---------------------------------------------------------------------------
+# Render tabs
+# ---------------------------------------------------------------------------
+
+tab_predict, tab_bracket, tab_leaderboard, tab_all_preds, tab_admin = st.tabs(
+    ["📝 Predict", "🏆 Bracket", "📊 Leaderboard", "👀 Predictions", "⚙️ Admin (results)"]
+)
+
+with tab_predict:
+    _predict_tab(gid, st.session_state.player["id"])
+with tab_bracket:
+    _bracket_tab(gid)
+with tab_leaderboard:
+    _leaderboard_tab(gid)
+with tab_all_preds:
+    _predictions_tab(gid)
+with tab_admin:
+    _admin_tab(gid)
