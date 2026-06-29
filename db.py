@@ -1,4 +1,10 @@
-"""SQLite data layer for the World Cup bracket predictor."""
+"""SQLite data layer for the World Cup bracket predictor.
+
+Runs against a local SQLite file by default.  When TURSO_URL and TURSO_TOKEN
+env vars are set (Streamlit Cloud secrets), all queries are sent to the Turso
+database over its HTTP pipeline API so data survives redeployments.
+"""
+import os
 import sqlite3
 import secrets
 import string
@@ -7,7 +13,6 @@ from contextlib import contextmanager
 DB_PATH = "predictor.db"
 GROUP_LIMIT = 20
 
-# Bracket structure: round_order defines progression.
 ROUNDS = ["R32", "R16", "QF", "SF", "F"]
 ROUND_LABELS = {
     "R32": "Round of 32",
@@ -19,11 +24,104 @@ ROUND_LABELS = {
 MATCHES_PER_ROUND = {"R32": 16, "R16": 8, "QF": 4, "SF": 2, "F": 1}
 
 
+# ---------------------------------------------------------------------------
+# Turso HTTP client — mimics sqlite3's Connection/Cursor interface
+# ---------------------------------------------------------------------------
+
+def _encode_arg(v):
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": str(v)}
+    return {"type": "text", "value": str(v)}
+
+
+def _decode_val(cell):
+    t = cell.get("type")
+    if t == "null" or t is None:
+        return None
+    if t == "integer":
+        return int(cell["value"])
+    if t == "float":
+        return float(cell["value"])
+    return cell.get("value")
+
+
+class _TursoCursor:
+    def __init__(self, result):
+        cols = [c["name"] for c in result["cols"]]
+        self._rows = [
+            {col: _decode_val(cell) for col, cell in zip(cols, row)}
+            for row in result["rows"]
+        ]
+        rowid = result.get("last_insert_rowid")
+        self.lastrowid = int(rowid) if rowid is not None else None
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+
+class _TursoConn:
+    def __init__(self, url, token):
+        # Accept both libsql:// and https:// URL schemes
+        self._endpoint = url.replace("libsql://", "https://").rstrip("/") + "/v2/pipeline"
+        self._token = token
+
+    def execute(self, sql, params=()):
+        import requests as _req
+        body = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql, "args": [_encode_arg(p) for p in params]}},
+                {"type": "close"},
+            ]
+        }
+        resp = _req.post(
+            self._endpoint,
+            json=body,
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        item = resp.json()["results"][0]
+        if item["type"] == "error":
+            raise RuntimeError(item["error"]["message"])
+        return _TursoCursor(item["response"]["result"])
+
+    def commit(self):
+        pass  # Turso auto-commits each statement
+
+    def close(self):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Connection factory
+# ---------------------------------------------------------------------------
+
+def _dict_factory(cursor, row):
+    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+
+
+def _connect():
+    url = os.environ.get("TURSO_URL", "")
+    token = os.environ.get("TURSO_TOKEN", "")
+    if url and token:
+        return _TursoConn(url, token)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = _dict_factory
+    return conn
+
+
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = _connect()
+    if isinstance(conn, sqlite3.Connection):
+        conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
@@ -31,61 +129,74 @@ def get_conn():
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Schema init
+# ---------------------------------------------------------------------------
+
 def init_db():
-    with get_conn() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS groups (
+    conn = _connect()
+    if isinstance(conn, sqlite3.Connection):
+        conn.execute("PRAGMA foreign_keys = ON")
+
+    for ddl in [
+        """CREATE TABLE IF NOT EXISTS groups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             last_synced_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS players (
+        )""",
+        """CREATE TABLE IF NOT EXISTS players (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             group_id INTEGER NOT NULL REFERENCES groups(id),
             name TEXT NOT NULL,
             password_hash TEXT,
             UNIQUE(group_id, name)
-        );
-
-        CREATE TABLE IF NOT EXISTS matches (
+        )""",
+        """CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             group_id INTEGER NOT NULL REFERENCES groups(id),
             round TEXT NOT NULL,
-            slot INTEGER NOT NULL,           -- position within round, 0-indexed
+            slot INTEGER NOT NULL,
             team_home TEXT,
             team_away TEXT,
-            actual_home INTEGER,             -- NULL until result entered
+            actual_home INTEGER,
             actual_away INTEGER,
             match_date TEXT,
             match_time TEXT,
             UNIQUE(group_id, round, slot)
-        );
-
-        CREATE TABLE IF NOT EXISTS predictions (
+        )""",
+        """CREATE TABLE IF NOT EXISTS predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             match_id INTEGER NOT NULL REFERENCES matches(id),
             player_id INTEGER NOT NULL REFERENCES players(id),
             pred_home INTEGER NOT NULL,
             pred_away INTEGER NOT NULL,
             UNIQUE(match_id, player_id)
-        );
-        """)
-    # Migration: add columns to existing databases that predate this schema
+        )""",
+    ]:
+        conn.execute(ddl)
+
+    conn.commit()
+    conn.close()
+
+    # Migration: add columns that didn't exist in older schema versions
     with get_conn() as conn:
-        for tbl_col in [
+        for tbl, col_def in [
             ("matches", "match_date TEXT"),
             ("matches", "match_time TEXT"),
             ("groups",  "last_synced_at TEXT"),
             ("players", "password_hash TEXT"),
         ]:
             try:
-                conn.execute(f"ALTER TABLE {tbl_col[0]} ADD COLUMN {tbl_col[1]}")
+                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col_def}")
             except Exception:
                 pass  # column already exists
 
+
+# ---------------------------------------------------------------------------
+# Group helpers
+# ---------------------------------------------------------------------------
 
 def gen_group_code(length=6):
     alphabet = string.ascii_uppercase + string.digits
@@ -99,14 +210,11 @@ def create_group(name):
             "INSERT INTO groups (code, name) VALUES (?, ?)", (code, name)
         )
         group_id = cur.lastrowid
-        # Seed empty bracket: R32 gets placeholder teams, later rounds blank (TBD).
         for rnd in ROUNDS:
             n = MATCHES_PER_ROUND[rnd]
             for slot in range(n):
-                if rnd == "R32":
-                    home, away = f"Team {slot*2 + 1}", f"Team {slot*2 + 2}"
-                else:
-                    home, away = None, None
+                home = f"Team {slot*2 + 1}" if rnd == "R32" else None
+                away = f"Team {slot*2 + 2}" if rnd == "R32" else None
                 conn.execute(
                     "INSERT INTO matches (group_id, round, slot, team_home, team_away) "
                     "VALUES (?, ?, ?, ?, ?)",
@@ -116,7 +224,6 @@ def create_group(name):
 
 
 def delete_group(group_id):
-    """Permanently delete a group and all its matches, players, and predictions."""
     with get_conn() as conn:
         conn.execute(
             "DELETE FROM predictions WHERE match_id IN "
@@ -137,7 +244,7 @@ def get_all_groups():
 
 def get_group_count():
     with get_conn() as conn:
-        return conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+        return conn.execute("SELECT COUNT(*) as cnt FROM groups").fetchone()["cnt"]
 
 
 def get_group_by_code(code):
@@ -145,6 +252,10 @@ def get_group_by_code(code):
         row = conn.execute("SELECT * FROM groups WHERE code = ?", (code,)).fetchone()
         return dict(row) if row else None
 
+
+# ---------------------------------------------------------------------------
+# Player helpers
+# ---------------------------------------------------------------------------
 
 def get_or_create_player(group_id, name, password=None):
     """Returns (player_dict, error_str). error_str is None on success."""
@@ -164,13 +275,30 @@ def get_or_create_player(group_id, name, password=None):
                 if pw_hash != player["password_hash"]:
                     return None, "Wrong password."
             return player, None
-        # New player — save password hash if provided
         cur = conn.execute(
             "INSERT INTO players (group_id, name, password_hash) VALUES (?, ?, ?)",
             (group_id, name, pw_hash),
         )
         return {"id": cur.lastrowid, "group_id": group_id, "name": name, "password_hash": pw_hash}, None
 
+
+def get_players(group_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM players WHERE group_id = ? ORDER BY name", (group_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def remove_player(player_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM predictions WHERE player_id=?", (player_id,))
+        conn.execute("DELETE FROM players WHERE id=?", (player_id,))
+
+
+# ---------------------------------------------------------------------------
+# Match helpers
+# ---------------------------------------------------------------------------
 
 def get_matches(group_id, round_=None):
     with get_conn() as conn:
@@ -210,27 +338,23 @@ def set_result(match_id, home, away):
             "UPDATE matches SET actual_home = ?, actual_away = ? WHERE id = ?",
             (home, away, match_id),
         )
-        match = conn.execute(
+        match = dict(conn.execute(
             "SELECT * FROM matches WHERE id = ?", (match_id,)
-        ).fetchone()
-        match = dict(match)
+        ).fetchone())
     _propagate_winner(match)
 
 
 def _winner_name(match):
-    """Return winner team name, or None if no result yet. Draws need manual
-    advance via set_winner_on_draw since this is knockout (no penalty data)."""
     if match["actual_home"] is None or match["actual_away"] is None:
         return None
     if match["actual_home"] > match["actual_away"]:
         return match["team_home"]
     if match["actual_away"] > match["actual_home"]:
         return match["team_away"]
-    return None  # draw -> needs penalty shootout winner, set separately
+    return None
 
 
 def set_draw_winner(match_id, winner_team_name):
-    """For knockout draws decided on penalties: explicitly set who advances."""
     with get_conn() as conn:
         match = dict(conn.execute(
             "SELECT * FROM matches WHERE id = ?", (match_id,)
@@ -245,7 +369,7 @@ def _propagate_winner(match, forced_winner=None):
     next_round_map = {"R32": "R16", "R16": "QF", "QF": "SF", "SF": "F"}
     rnd = match["round"]
     if rnd not in next_round_map:
-        return  # Final has no next round
+        return
     next_round = next_round_map[rnd]
     next_slot = match["slot"] // 2
     is_home = (match["slot"] % 2 == 0)
@@ -263,15 +387,11 @@ def _propagate_winner(match, forced_winner=None):
         )
 
 
-def remove_player(player_id):
-    """Delete a player and all their predictions from the group."""
-    with get_conn() as conn:
-        conn.execute("DELETE FROM predictions WHERE player_id=?", (player_id,))
-        conn.execute("DELETE FROM players WHERE id=?", (player_id,))
-
+# ---------------------------------------------------------------------------
+# Prediction helpers
+# ---------------------------------------------------------------------------
 
 def get_match_predictions(match_id):
-    """Return all predictions for a match with player names, ordered by player name."""
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT p.name, pr.pred_home, pr.pred_away
@@ -303,13 +423,9 @@ def upsert_prediction(match_id, player_id, pred_home, pred_away):
         )
 
 
-def get_players(group_id):
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM players WHERE group_id = ? ORDER BY name", (group_id,)
-        ).fetchall()
-        return [dict(r) for r in rows]
-
+# ---------------------------------------------------------------------------
+# Live-score sync tracking
+# ---------------------------------------------------------------------------
 
 def get_last_synced(group_id):
     with get_conn() as conn:
@@ -327,9 +443,11 @@ def set_last_synced(group_id):
         )
 
 
+# ---------------------------------------------------------------------------
+# Leaderboard
+# ---------------------------------------------------------------------------
+
 def compute_leaderboard(group_id):
-    """1 point for correct outcome (win/draw/loss direction), +1 bonus (2 total)
-    for exact scoreline. Only matches with a result count."""
     matches = [m for m in get_matches(group_id) if m["actual_home"] is not None]
     players = get_players(group_id)
     scores = {p["id"]: {"name": p["name"], "points": 0, "exact": 0, "correct": 0} for p in players}
@@ -354,8 +472,7 @@ def compute_leaderboard(group_id):
                     scores[p["player_id"]]["exact"] += 1
                 scores[p["player_id"]]["points"] += pts
 
-    leaderboard = sorted(scores.values(), key=lambda s: -s["points"])
-    return leaderboard
+    return sorted(scores.values(), key=lambda s: -s["points"])
 
 
 def _outcome(home, away):
