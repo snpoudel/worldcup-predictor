@@ -203,7 +203,12 @@ if st.session_state.player is None:
     st.stop()
 
 # ---------- auto-sync live scores once per hour ----------
-_last = db.get_last_synced(gid)
+# Cache the last-synced time in session_state so we only hit the DB once per
+# browser session instead of on every Streamlit rerun (every click/interaction).
+if "last_synced_checked" not in st.session_state:
+    st.session_state.last_synced_checked = db.get_last_synced(gid)
+
+_last = st.session_state.last_synced_checked
 _needs_sync = True
 if _last:
     try:
@@ -215,6 +220,7 @@ if _needs_sync:
     with st.spinner("Syncing live scores…"):
         live_scores.sync_results(gid, db)
         db.set_last_synced(gid)
+        st.session_state.last_synced_checked = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 # Status bar — visible on mobile without opening the sidebar
 if "confirm_exit" not in st.session_state:
